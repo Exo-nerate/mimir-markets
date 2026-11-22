@@ -24,7 +24,10 @@ use crate::escrow;
 use crate::events;
 use crate::fees;
 use crate::storage;
-use crate::types::{Challenger, Claim, ClaimState, Error, PayoutQuote, Verdict, WinnerSide};
+use crate::types::{
+    Challenger, Claim, ClaimPreflight, ClaimState, Error, PayoutQuote, PreflightReason, Verdict,
+    WinnerSide,
+};
 use crate::util;
 
 pub fn resolve_claim(
@@ -243,6 +246,7 @@ pub fn resolve_claim_versioned(
     }
     .publish(env);
     
+    claim.revision = claim.revision.checked_add(1).ok_or(Error::Overflow)?;
     storage::set_claim(env, claim_id, &claim);
     // Persist the verdict with its explicit version tag. `claim.winner_side`
     // remains the compatibility mirror for callers that read the claim struct.
@@ -490,6 +494,7 @@ pub fn claim_fees(env: &Env, who: Address) -> Result<i128, Error> {
         return Ok(0);
     }
     storage::clear_accrued_fees(env, &who); // effects before interaction
+    storage::add_claimed_fees(env, &who, amount);
     storage::add_lifetime_fees_claimed(env, amount);
     let usdc = storage::usdc(env)?;
     escrow::push(env, &usdc, &who, amount);

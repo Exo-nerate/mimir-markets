@@ -180,16 +180,39 @@ jobs:
       # Bindings drift guard: regenerate sdk/contracts/* from the freshly built
       # wasm with the pinned stellar-cli and fail if the committed bindings
       # differ. A contract signature change without regenerated bindings fails
-      # here instead of at runtime as a simulation error. Offline: no network,
-      # no secrets. See docs/CONTRACT_TOOLCHAINS.md for the regenerate command.
+      # here instead of at runtime as a simulation error. No secrets are used.
+      # See docs/CONTRACT_TOOLCHAINS.md for the regenerate command.
+      #
+      # stellar-cli is installed from its official GitHub release rather than
+      # npm: the CLI ships as a Rust binary and is not published as an npm
+      # package. The pin must be able to decode the spec of the soroban-sdk the
+      # contracts use (25.x SDK needs a 25.x CLI); an older CLI fails the run
+      # with "xdr processing error: xdr value invalid" instead of reporting
+      # binding drift. Bump both numbers together with soroban-sdk.
+      - if: matrix.name == 'release'
+        name: install pinned stellar-cli
+        env:
+          STELLAR_CLI_VERSION: 25.2.0
+          STELLAR_CLI_SHA256: da809a7b6ec3e66a5dd6ebdf199cdd638007bd5c063bfd6d18ae63a18b1b86b6
+        run: |
+          set -euo pipefail
+          archive="stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/${archive}"
+          echo "${STELLAR_CLI_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
+          mkdir -p "${RUNNER_TEMP}/stellar-cli"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/stellar-cli" stellar
+          echo "${RUNNER_TEMP}/stellar-cli" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/stellar-cli/stellar" --version
       - if: matrix.name == 'release'
         name: check generated contract bindings are up to date
         run: |
           set -euo pipefail
-          npx --yes @stellar/stellar-cli@22.8.1 contract bindings typescript \
+          stellar contract bindings typescript \
             --wasm contracts-soroban/target/wasm32v1-none/release/mimir_market.wasm \
             --output-dir sdk/contracts/mimir-market --overwrite
-          npx --yes @stellar/stellar-cli@22.8.1 contract bindings typescript \
+          stellar contract bindings typescript \
             --wasm contracts-soroban/target/wasm32v1-none/release/mimir_squad.wasm \
             --output-dir sdk/contracts/mimir-squad --overwrite
           git diff --exit-code sdk/contracts

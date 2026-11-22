@@ -16,7 +16,15 @@ use crate::util;
 /// single persistent entry written by `create_claim`.
 const CREATOR_INDEX_PAGE_SIZE: u32 = 100;
 
-fn creator_index_page_key(env: &Env, creator: &Address, page: u32) {
+/// TTL budget for per-creator index entries, matching the crate's other
+/// persistent rows.
+const CREATOR_INDEX_BUMP: u32 = 518_400;
+
+fn creator_index_page_key(
+    _env: &Env,
+    creator: &Address,
+    page: u32,
+) -> (soroban_sdk::Symbol, Address, u32) {
     (
         soroban_sdk::symbol_short!("cclm_pg"),
         creator.clone(),
@@ -24,7 +32,7 @@ fn creator_index_page_key(env: &Env, creator: &Address, page: u32) {
     )
 }
 
-fn creator_index_count_key(env: &Env, creator: &Address) {
+fn creator_index_count_key(_env: &Env, creator: &Address) -> (soroban_sdk::Symbol, Address) {
     (soroban_sdk::symbol_short!("cclm_ct"), creator.clone())
 }
 
@@ -71,14 +79,18 @@ pub fn get_creator_claims(
         }
     }
     // TTL extension like other reads.
-    env.storage().persistent().extend_ttl(&count_key, 30, env.ledger().max_ttl() / 2);
+    env.storage()
+        .persistent()
+        .extend_ttl(&count_key, 30, CREATOR_INDEX_BUMP);
     if out.len() > 0 {
         let first_page = offset / CREATOR_INDEX_PAGE_SIZE;
         let last_page = (index - 1) / CREATOR_INDEX_PAGE_SIZE;
         let mut p = first_page;
         while p <= last_page {
             let key = creator_index_page_key(env, &creator, p);
-            env.storage().persistent().extend_ttl(&key, 30, env.ledger().max_ttl() / 2);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, 30, CREATOR_INDEX_BUMP);
             p += 1;
         }
     }
@@ -160,6 +172,7 @@ pub fn create_claim(env: &Env, creator: Address, params: CreateParams) -> Result
         remaining_escrow: 0,
         challenger_claims: 0,
         created_at: env.ledger().timestamp(),
+        revision: 1,
         evidence_hash: None,
         context_hash: params.context_hash,
         market: MarketConfig {
@@ -318,6 +331,7 @@ pub fn challenge_claim(
     claim.total_challenger_stake = next_total_challenger_stake;
     claim.challenger_count = next_challenger_count;
     claim.state = ClaimState::Active;
+    claim.revision = claim.revision.checked_add(1).ok_or(Error::Overflow)?;
     util::assert_claim_conservation(&claim)?;
     storage::set_claim(env, claim_id, &claim);
 
@@ -345,7 +359,139 @@ pub fn challenge_claim(
             challenger: challenger.clone(),
             stake: stake_amount,
             gross: fixed_odds_gross,
+            profit: fixed_odds_profit,
+            reserved_creator_liability: claim.reserved_creator_liability,
+            available_creator_liquidity: claim
+                .creator_stake
+                .checked_sub(claim.reserved_creator_liability)
+                .ok_or(Error::InsufficientCreatorLiquidity)?,
         }
         .publish(env);
     }
+    Ok(())
+}
+
+/// Move an Open claim past its deadline to `Cancelled`, refunding the creator.
+///
+/// Only an `Open` claim with no counterparty exposure can be transitioned this
+/// way; an `Active` claim is left for settlement, and its state is preserved so
+/// the deadline read still bumps the entry's TTL. Permissionless once the
+/// deadline has passed: the claim has no challengers to consult.
+pub fn transition_deadline(env: &Env, claim_id: u64) -> Result<(), Error> {
+    let mut claim = storage::get_claim(env, claim_id)?;
+    if claim.state == ClaimState::Active {
+        return Ok(());
+    }
+    if claim.state != ClaimState::Open {
+        return Err(Error::ClaimNotOpen);
+    }
+    if env.ledger().timestamp() < claim.deadline {
+        return Err(Error::Timelocked);
+    }
+    util::assert_claim_conservation(&claim)?;
+
+    let usdc = storage::usdc(env)?;
+    let refund = claim.creator_stake;
+    if escrow::balance(env, &usdc) < refund {
+        return Err(Error::RefundNotEscrowed);
+    }
+
+    events::DeadlineReached {
+        id: claim_id,
+        deadline: claim.deadline,
+        challenger_count: claim.challenger_count,
+        total_staked: claim.creator_stake,
+    }
+    .publish(env);
+
+    claim.state = ClaimState::Cancelled;
+    claim.revision = claim.revision.checked_add(1).ok_or(Error::Overflow)?;
+    let creator = claim.creator.clone();
+    storage::set_claim(env, claim_id, &claim);
+
+    events::ClaimStateTransitioned {
+        id: claim_id,
+        from_state: ClaimState::Open as u32,
+        to_state: ClaimState::Cancelled as u32,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
+
+    // A refund is not profit, so no fee leg exists. `parked` reports the DELTA
+    // because the creator may already hold an unrelated parked balance.
+    let pending_before = storage::withdrawable(env, &creator);
+    escrow::push_or_park(env, &usdc, &creator, refund);
+    events::ClaimCancelled {
+        id: claim_id,
+        refund,
+        parked: storage::withdrawable(env, &creator) > pending_before,
+    }
+    .publish(env);
+    Ok(())
+}
+
+/// Cancel an Open claim before its deadline and refund the creator.
+///
+/// Cancellation is the one lifecycle transition where the creator, not the
+/// oracle, moves money out of escrow, so it is guarded on the claim's OWN
+/// accounting rather than just its state label: any challenger stake or
+/// reserved creator liability refuses the refund with
+/// [`Error::ClaimHasActiveClaims`], which is what a stale read or a lost state
+/// transition would otherwise let through. Refunds are never paused.
+pub fn cancel_claim(env: &Env, claim_id: u64) -> Result<(), Error> {
+    let mut claim = storage::get_claim(env, claim_id)?;
+    claim.creator.require_auth();
+    if claim.state == ClaimState::Cancelled {
+        return Ok(());
+    }
+    if claim.state != ClaimState::Open {
+        return Err(Error::ClaimNotOpen);
+    }
+    if claim.challenger_count > 0
+        || claim.total_challenger_stake > 0
+        || claim.reserved_creator_liability > 0
+    {
+        events::CancellationRefused {
+            id: claim_id,
+            challenger_count: claim.challenger_count,
+            total_challenger_stake: claim.total_challenger_stake,
+            reserved_creator_liability: claim.reserved_creator_liability,
+            reason: Error::ClaimHasActiveClaims as u32,
+        }
+        .publish(env);
+        return Err(Error::ClaimHasActiveClaims);
+    }
+    util::assert_claim_conservation(&claim)?;
+
+    let usdc = storage::usdc(env)?;
+    let refund = claim.creator_stake;
+    if escrow::balance(env, &usdc) < refund {
+        return Err(Error::RefundNotEscrowed);
+    }
+
+    claim.state = ClaimState::Cancelled;
+    claim.remaining_escrow = 0;
+    claim.revision = claim.revision.checked_add(1).ok_or(Error::Overflow)?;
+    let creator = claim.creator.clone();
+    storage::set_claim(env, claim_id, &claim);
+
+    events::ClaimStateTransitioned {
+        id: claim_id,
+        from_state: ClaimState::Open as u32,
+        to_state: ClaimState::Cancelled as u32,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
+
+    // NOTE: deliberately NOT gated on the pause flag — a pause must never block
+    // a refund of already-committed funds.
+    let pending_before = storage::withdrawable(env, &creator);
+    escrow::push_or_park(env, &usdc, &creator, refund);
+    events::ClaimCancelled {
+        id: claim_id,
+        refund,
+        parked: storage::withdrawable(env, &creator) > pending_before,
+    }
+    .publish(env);
+    Ok(())
 }
