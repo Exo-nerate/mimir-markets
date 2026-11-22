@@ -1,6 +1,6 @@
 //! Storage keys and typed accessors.
 
-use soroban_sdk::{contracttype, Address, Env};
+use soroban_sdk::{contracttype, Address, Env, Vec};
 
 use crate::types::{Error, Market, PendingFeeRecipient, PendingOracle};
 
@@ -28,6 +28,10 @@ pub enum DataKey {
     /// delivered, because the token transfer trapped (frozen or deauthorized
     /// trustline). Parked until `claim_parked_payout` can move it.
     Payout(u64, u32, Address),
+    /// (market, side) -> open participants in deposit order. Membership follows
+    /// the deposit entries: a new depositor is appended and a full withdrawal
+    /// is removed, so the roster is exactly the set of non-zero positions.
+    Participants(u64, u32),
 }
 
 const BUMP_THRESHOLD: u32 = 120_960;
@@ -218,6 +222,57 @@ pub fn mark_claimed(env: &Env, id: u64, side: u32, who: &Address) {
     env.storage()
         .persistent()
         .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+}
+
+// ── Participants ─────────────────────────────────────────────────────────────
+
+/// Open participants on one side of a market, in deposit order.
+pub fn participants(env: &Env, id: u64, side: u32) -> Vec<Address> {
+    let key = DataKey::Participants(id, side);
+    match env.storage().persistent().get::<_, Vec<Address>>(&key) {
+        Some(list) => {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+            list
+        }
+        None => Vec::new(env),
+    }
+}
+
+fn set_participants(env: &Env, id: u64, side: u32, list: &Vec<Address>) {
+    let key = DataKey::Participants(id, side);
+    if list.is_empty() {
+        env.storage().persistent().remove(&key);
+        return;
+    }
+    env.storage().persistent().set(&key, list);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+}
+
+/// Record a new position. Order is append-only, so a roster position is stable
+/// for as long as the position is open.
+pub fn push_participant(env: &Env, id: u64, side: u32, who: &Address) {
+    let mut list = participants(env, id, side);
+    list.push_back(who.clone());
+    set_participants(env, id, side, &list);
+}
+
+/// Drop a position that has been fully withdrawn, keeping the remaining deposit
+/// order intact so pagination cursors keep walking the same sequence.
+pub fn remove_participant(env: &Env, id: u64, side: u32, who: &Address) {
+    let list = participants(env, id, side);
+    let mut next: Vec<Address> = Vec::new(env);
+    for entry in list.iter() {
+        if entry != *who {
+            next.push_back(entry);
+        }
+    }
+    if next.len() != list.len() {
+        set_participants(env, id, side, &next);
+    }
 }
 
 // ── Parked payouts ───────────────────────────────────────────────────────────

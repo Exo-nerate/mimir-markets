@@ -1,134 +1,120 @@
-#use super::*;
+#![cfg(test)]
+//! Timelocked fee-recipient rotation: queue, cancel, execute, auth, and payout
+//! routing.
 
-//! Tests for timelocked fee recipient rotation in the squad contract.
+extern crate std;
 
-#fn setup() -> (Env, Address, MimirSquad) {
-    let env = Env::default();
-    env.mock_all_authentications();
+use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{Address, InvokeError};
 
-    let admin = Address::generate(&heartbeat);
-    let fee = Address::generate(&heartbeat);
-    let token = Address::generate(&heartbeat);
+use crate::test_common::{Fixture, DEFAULT_DURATION, USDC};
+use crate::types::{Error, FEE_RECIPIENT_TIMELOCK_SECONDS, SIDE_A, SIDE_B};
 
-    let contract_id = env.register(MimirSquad,());
-    let client = MimirSquadClient::new(&env, &contract_id);
+#[test]
+fn queue_records_the_pending_recipient_and_keeps_the_current_one() {
+    let f = Fixture::new();
+    let next = Address::generate(&f.env);
 
-    client.initialize(
-        &admin,
-        &fee,
-        &token,
-        &10000,
-        &None,
-        &None,
-        &None,
-        &None,
+    f.client().queue_fee_recipient(&next);
+
+    assert_eq!(f.client().get_pending_fee_recipient(), Some(next.clone()));
+    assert_eq!(f.client().get_fee_recipient(), f.fee_recipient);
+}
+
+#[test]
+fn queue_is_gated_on_the_current_fee_recipient() {
+    let f = Fixture::new();
+    let next = Address::generate(&f.env);
+
+    f.env.set_auths(&[]);
+    assert_eq!(
+        f.client().try_queue_fee_recipient(&next),
+        Err(Err(InvokeError::Abort))
     );
-
-    (env, fee, client)
+    assert_eq!(f.client().get_pending_fee_recipient(), None);
 }
 
 #[test]
-fn test_queue_and_get_pending_fee_recipient() {
-    let (env, fee, client) = setup();
-    let new_recipient = Address::generate(&heartbeat);
+fn execute_before_the_timelock_is_rejected() {
+    let f = Fixture::new();
+    let next = Address::generate(&f.env);
 
-    client.queue_feerecipient(&fee, &new_recipient);
+    f.client().queue_fee_recipient(&next);
+    let queued = f.client().get_pending_fee_recipient().unwrap();
+    assert_eq!(queued, next);
 
-    assert_eq(client.get_pending_fee_recipient(), Some(new_recipient.clone()));
-    assert_eq(client.get_fee_recipient(), fee);
+    f.advance_by(FEE_RECIPIENT_TIMELOCK_SECONDS - 1);
+    assert_eq!(
+        f.client().try_execute_fee_recipient(),
+        Err(Ok(Error::Timelocked))
+    );
+    assert_eq!(f.client().get_fee_recipient(), f.fee_recipient);
+    assert_eq!(f.client().get_pending_fee_recipient(), Some(next.clone()));
+
+    f.advance_by(1);
+    f.client().execute_fee_recipient();
+    assert_eq!(f.client().get_fee_recipient(), next);
+    assert_eq!(f.client().get_pending_fee_recipient(), None);
 }
 
 #[test]
-fn_test_queue_unauthorized() {
-    let (_env, _fee, client) = setup();
-    let intruder = Address::generate(&heartbeat);
-    let new_recipient = Address::generate(&heartbeat);
+fn execute_is_permissionless_once_the_timelock_has_elapsed() {
+    let f = Fixture::new();
+    let next = Address::generate(&f.env);
 
-    let res = client.try_queue_fee_recipient(&intruder, &new_recipient);
-    assert!(res.is_errb());
-    assert_eq(client.get_pending_fee_recipient(), None);
+    f.client().queue_fee_recipient(&next);
+    f.advance_by(FEE_RECIPIENT_TIMELOCK_SECONDS);
+
+    f.env.set_auths(&[]);
+    f.client().execute_fee_recipient();
+    assert_eq!(f.client().get_fee_recipient(), next);
 }
 
 #[test]
-fn_test_cancel_rotation() {
-    let (env, fee, client) = setup();
-    let new_recipient = Address::generate(&heartbeat);
+fn cancel_clears_the_queue_and_keeps_the_current_recipient() {
+    let f = Fixture::new();
+    let next = Address::generate(&f.env);
 
-    client.queue_fee_recipient(&fee, &new_recipient);
-    client.cancel_fee_recipient(&fee);
+    f.client().queue_fee_recipient(&next);
+    f.client().cancel_fee_recipient();
 
-    assert_eq(client.get_pending_fee_recipient(), None);
-    assert_eq(client.get_fee_recipient(), fee);
+    assert_eq!(f.client().get_pending_fee_recipient(), None);
+    assert_eq!(f.client().get_fee_recipient(), f.fee_recipient);
+    assert_eq!(
+        f.client().try_cancel_fee_recipient(),
+        Err(Ok(Error::NoFeeRecipientQueued))
+    );
+    assert_eq!(
+        f.client().try_execute_fee_recipient(),
+        Err(Ok(Error::NoFeeRecipientQueued))
+    );
 }
 
 #[test]
-fn_test_cancel_unauthorized() {
-    let (_env, fee, client) = setup();
-    let new_recipient = Address::generate(&heartbeat);
-    let intruder = Address::generate(&heartbeat);
+fn fees_accrued_before_rotation_are_paid_to_the_new_recipient() {
+    let f = Fixture::new();
+    let next = Address::generate(&f.env);
+    let captain = f.user(0);
+    let id = f.market(&captain, 500); // 5% fee on profit
 
-    client.queue_fee_recipient(&fee, &new_recipient);
-    let res = client.try_cancel_fee_recipient(&intruder);
-    assert!(res.is_errb());
-    assert_eq(client.get_pending_fee_recipient(), Some(new_recipient));
-}
+    let winner = f.user(10 * USDC);
+    f.client().deposit(&winner, &id, &SIDE_A, &(10 * USDC));
+    let loser = f.user(10 * USDC);
+    f.client().deposit(&loser, &id, &SIDE_B, &(10 * USDC));
 
-#[test]
-fn_test_execute_before_timelock() {
-    let (env, fee, client) = setup();
-    let new_recipient = Address::generate(&heartbeat);
+    f.advance_by(DEFAULT_DURATION);
+    f.client().resolve(&id, &SIDE_A);
+    f.client().claim(&winner, &id, &SIDE_A);
 
-    client.queue_fee_recipient(&fee, &new_recipient);
-    let res = client.try_execute_fee_recipient(&fee);
-    assert!(res.is_err());
-    assert_eq(client.get_fee_recipient(), fee);
-    assert_eq(client.get_pending_fee_recipient(), Some(new_recipient));
-    // Advancing time is not enough before the timelock elapses.
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-}
+    let accrued = f.client().get_accrued_fees();
+    assert!(accrued > 0, "the winning claim must accrue a fee");
 
-#[test]
-fn test_execute_unauthorized() {
-    let (env, fee, client) = setup();
-    let new_recipient = Address::generate(&heartbeat);
-    let intruder = Address::generate(&heartbeat);
+    f.client().queue_fee_recipient(&next);
+    f.advance_by(FEE_RECIPIENT_TIMELOCK_SECONDS);
+    f.client().execute_fee_recipient();
 
-    client.queue_fee_recipient(&fee, &new_recipient);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
-    let res = client.try_execute_fee_recipient(&intruder);
-    assert!(res.is_err());
-    assert_eq(client.get_fee_recipient(), fee);
-}
-
-#[test]
-fn test_execute_after_timelock() {
-    let (env, fee, client) = setup();
-    let new_recipient = Address::generate(&heartbeat);
-
-    client.queue_fee_recipient(&fee, &new_recipient);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
-
-    client.execute_fee_recipient(&fee);
-
-    assert_eq(client.get_fee_recipient(), new_recipient);
-    assert_eq(client.get_pending_fee_recipient(), None);
-}
-
-#[test]
-fn_test_claim_fees_after_rotation_pays_new_recipient() {
-    let (env, fee, client) = setup();
-    let new_recipient = Address::generate(&heartbeat);
-
-    // Accrue fees under the old recipient.
-    client.accrue_fees(&100);
-
-    client.queue_fee_recipient(&fee, &new_recipient);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
-    client.execute_fee_recipient(&fee);
-
-    // Accrued but unclaimed fees go to the new recipient.
-    client.claim_fees();
-
-    assert_eq(client.get_fee_recipient(), new_recipient);
-    assert_eq(client.get_accrued_fees(), 0);
+    let before = f.token().balance(&next);
+    assert_eq!(f.client().claim_fees(), accrued);
+    assert_eq!(f.token().balance(&next) - before, accrued);
+    assert_eq!(f.token().balance(&f.fee_recipient), 0);
 }

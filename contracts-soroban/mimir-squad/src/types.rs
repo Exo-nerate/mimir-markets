@@ -1,6 +1,6 @@
 //! Value types for the squad pool. Mirrors `contracts/MimirSquad.sol`.
 
-use soroban_sdk::{contracterror, contracttype, Address};
+use soroban_sdk::{contracterror, contracttype, Address, Vec};
 
 /// Version tag for the squad settlement manifest. Bump on any change to the
 /// manifest's encoded layout so off-chain indexers can reject unknown shapes.
@@ -28,6 +28,11 @@ pub const MAX_DURATION: u64 = 31_536_000; // 365 days
 
 /// Maximum number of market ids accepted by `get_markets_batch` in a single call.
 pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Maximum number of entitlement records returned by `get_entitlements_page` in
+/// a single call. A page is refused rather than truncated when `limit` exceeds
+/// this, so a caller always knows the window it asked for was served whole.
+pub const MAX_ENTITLEMENT_PAGE: u32 = 50;
 
 /// Upper bound on the byte length of a market question.
 ///
@@ -92,6 +97,74 @@ pub struct ClaimResult {
     pub gross: i128,
     pub fee: i128,
     pub net: i128,
+}
+
+/// One participant's read-only entitlement in a squad market.
+///
+/// Amounts are exact integer USDC atomic units, computed by the same helpers
+/// `claim` uses, so a record never disagrees with the payout it previews.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantEntitlement {
+    pub participant: Address,
+    pub side: u32,
+    /// Deposited amount on this side, before any payout.
+    pub principal: i128,
+    /// Gross payout the participant would receive, before fees.
+    pub gross: i128,
+    /// Fee charged on profit only.
+    pub fee: i128,
+    /// Amount the participant would receive: `gross - fee`.
+    pub net: i128,
+    /// Whether the participant has already pulled this position.
+    pub claimed: bool,
+}
+
+/// A paginated window into a squad market's participant entitlements.
+///
+/// `items` holds up to `limit` records starting at `offset`, ordered by side
+/// (`SIDE_A` entries first, then `SIDE_B`), each side in deposit order.
+/// `total` is the full roster length so a caller can detect the last page
+/// without fetching an extra empty one.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntitlementPage {
+    pub items: Vec<ParticipantEntitlement>,
+    /// Roster position of the first item returned, clamped to `total`.
+    pub offset: u32,
+    /// Total number of participants across both sides, not just this page.
+    pub total: u32,
+}
+
+/// Refundable liabilities a cancellation of `market_id` would create.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelPreview {
+    pub refund_a: i128,
+    pub refund_b: i128,
+}
+
+/// Read-only settlement readiness for one market. Reported independently of
+/// `resolved` so a caller can tell whether pre-deadline withdrawals are still
+/// open, and whether the oracle may resolve yet.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementReadiness {
+    pub resolved: bool,
+    pub oracle_ready: bool,
+    pub withdrawal_open: bool,
+    pub remaining_escrow: i128,
+}
+
+/// The policy limits `create_market` enforces, so clients can read them
+/// instead of probing live calls for failures.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SquadLimits {
+    pub max_fee_bps: u32,
+    pub min_duration: u64,
+    pub max_duration: u64,
+    pub max_question_bytes: u32,
 }
 
 /// Versioned, digest-bound settlement manifest. Binds the winning side, fee
@@ -187,4 +260,10 @@ pub enum Error {
     UnsupportedManifestVersion = 35,
     /// The settlement manifest digest does not match the bound market state.
     ManifestDigestMismatch = 36,
+    /// `get_entitlements_page` was called with a `limit` above
+    /// [`MAX_ENTITLEMENT_PAGE`]. Refused before reading any entitlement.
+    PageTooLarge = 37,
+    /// The pool is paused: new deposits and market creation are refused while
+    /// withdrawals, claims and parked-payout retries stay available.
+    Paused = 38,
 }

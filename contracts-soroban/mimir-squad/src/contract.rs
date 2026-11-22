@@ -7,8 +7,8 @@ use crate::escrow;
 use crate::pool;
 use crate::storage;
 use crate::types::{
-    ClaimResult, Error, Market, PendingOracle, SettlementReadiness, SquadLimits, MAX_BATCH_SIZE,
-    MAX_DURATION, MAX_FEE_BPS, MAX_QUESTION_BYTES, MIN_DURATION,
+    CancelPreview, ClaimResult, EntitlementPage, Error, Market, PendingOracle, SettlementReadiness,
+    SquadLimits, MAX_BATCH_SIZE, MAX_DURATION, MAX_FEE_BPS, MAX_QUESTION_BYTES, MIN_DURATION,
 };
 
 #[contract]
@@ -122,6 +122,25 @@ impl MimirSquad {
         storage::is_paused(&env)
     }
 
+    /// A paginated, read-only window into a market's participant entitlements.
+    ///
+    /// Returns up to `limit` records starting at `offset` (0-based); `limit = 0`
+    /// returns every remaining record. `limit` above `MAX_ENTITLEMENT_PAGE` is
+    /// refused, so one page is always bounded. The roster is ordered `SIDE_A`
+    /// entries first, then `SIDE_B`, each in deposit order, and `total` reports
+    /// the full roster length so a caller can detect the last page.
+    ///
+    /// Read-only: no auth, no token transfer, no state mutation. Amounts are
+    /// exact integer USDC atomic units and match what `claim` would pay now.
+    pub fn get_entitlements_page(
+        env: Env,
+        market_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Result<EntitlementPage, Error> {
+        pool::entitlements_page(&env, market_id, offset, limit)
+    }
+
     pub fn get_markets_batch(
         env: Env,
         ids: Vec<u64>,
@@ -181,11 +200,7 @@ impl MimirSquad {
         who: Address,
     ) -> Result<(i128, bool), Error> {
         let already_claimed = storage::has_claimed(&env, market_id, side, &who);
-        let claimable = match pool::preview_claim(&env, market_id, side, &who) {
-            Ok(preview) => preview.amount,
-            Err(Error::NoPosition) => 0,
-            Err(e) => return Err(e),
-        };
+        let claimable = pool::preview_claim(&env, market_id, side, &who)?.net;
         Ok((claimable, already_claimed))
     }
 
@@ -242,7 +257,7 @@ impl MimirSquad {
     }
 
     pub fn get_pending_fee_recipient(env: Env) -> Option<Address> {
-        storage::pending_fee_recipient(&env)
+        storage::pending_fee_recipient(&env).map(|pending| pending.next)
     }
 
     pub fn get_escrow_balance(env: Env) -> Result<i128, Error> {

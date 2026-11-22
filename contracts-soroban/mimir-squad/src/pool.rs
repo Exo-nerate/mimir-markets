@@ -7,13 +7,12 @@ use crate::escrow;
 use crate::events;
 use crate::storage;
 use crate::types::{
-    ClaimResult, Error, Market, PendingOracle, BPS_DIVISOR, MAX_DURATION, MAX_FEE_BPS,
+    CancelPreview, ClaimResult, EntitlementPage, Error, Market, ParticipantEntitlement,
+    PendingFeeRecipient, PendingOracle, SettlementReadiness, BPS_DIVISOR,
+    FEE_RECIPIENT_TIMELOCK_SECONDS, MAX_DURATION, MAX_ENTITLEMENT_PAGE, MAX_FEE_BPS,
     MAX_PARTICIPANTS_PER_SIDE, MAX_QUESTION_BYTES, MAX_SQUAD_MEMBERS, MIN_DURATION,
-    ORACLE_TIMELOCK_SECONDS, RESULT_CANCELLED, SIDE_A, SIDE_B,
+    ORACLE_TIMELOCK_SECONDS, RESULT_CANCELLED, SETTLEMENT_MANIFEST_VERSION, SIDE_A, SIDE_B,
 };
-
-#[cfg(test)]
-mod payout_fixtures;
 
 /// The fee on one winning claim: `floor(profit * fee_bps / BPS_DIVISOR)`.
 ///
@@ -108,8 +107,6 @@ fn winner_gross(market: &Market, principal: i128) -> Result<i128, Error> {
 /// Preimage layout (all integers big-endian):
 ///   version (u32) || market_id (u64) || result (u32) || fee_bps (u32) ||
 ///   pool_a (i128) || pool_b (i128) || remaining_escrow (i128)
-pub const SETTLEMENT_MANIFEST_VERSION: u32 = 1;
-
 pub(crate) fn settlement_manifest_digest(
     env: &Env,
     market_id: u64,
@@ -164,6 +161,9 @@ pub fn create_market(
     fee_bps: u32,
 ) -> Result<u64, Error> {
     captain.require_auth();
+    if storage::is_paused(env) {
+        return Err(Error::Paused);
+    }
 
     if question.is_empty() {
         return Err(Error::EmptyQuestion);
@@ -220,6 +220,9 @@ pub fn deposit(
     amount: i128,
 ) -> Result<(), Error> {
     participant.require_auth();
+    if storage::is_paused(env) {
+        return Err(Error::Paused);
+    }
 
     let mut market = storage::get_market(env, market_id)?;
     if market.resolved || env.ledger().timestamp() >= market.deadline {
@@ -265,6 +268,12 @@ pub fn deposit(
     escrow::pull(env, &usdc, &participant, amount)?;
 
     storage::set_deposit(env, market_id, side, &participant, previous + amount);
+    if previous == 0 {
+        // The deposit is now committed, so the roster gains the position. A
+        // rejected transfer above leaves both the deposit and the roster
+        // untouched.
+        storage::push_participant(env, market_id, side, &participant);
+    }
     if side == SIDE_A {
         market.pool_a += amount;
     } else {
@@ -337,6 +346,9 @@ pub fn withdraw_before_deadline(
 
     let next = balance - amount;
     storage::set_deposit(env, market_id, side, &participant, next);
+    if next == 0 {
+        storage::remove_participant(env, market_id, side, &participant);
+    }
     if side == SIDE_A {
         market.pool_a -= amount;
         if next == 0 {
@@ -532,12 +544,12 @@ pub fn cancel_market(env: &Env, market_id: u64) -> Result<(), Error> {
 /// create, without performing it.
 ///
 /// Read-only: no state is written, no tokens move, and no authority changes.
-/// The returned `ClaimResult` reports the refund owed to each side as
-/// `gross == net == pool total` and `fee == 0`, matching what `cancel_market`
-/// followed by `claim` would pay. Returns [`Error::AlreadyResolved`] if the
+/// The returned [`CancelPreview`] reports the refund owed to each side as its
+/// full pool total, matching what `cancel_market` followed by `claim` would
+/// pay. Returns [`Error::AlreadyResolved`] if the
 /// market is settled and [`Error::MarketClosed`] once the deadline has passed,
 /// mirroring `cancel_market`'s own gating.
-pub fn preview_cancel_market(env: &Env, market_id: u64) -> Result<(ClaimResult, ClaimResult), Error> {
+pub fn preview_cancel_market(env: &Env, market_id: u64) -> Result<CancelPreview, Error> {
     let market = storage::get_market(env, market_id)?;
 
     if market.resolved {
@@ -547,17 +559,10 @@ pub fn preview_cancel_market(env: &Env, market_id: u64) -> Result<(ClaimResult, 
         return Err(Error::MarketClosed);
     }
 
-    let refund_a = ClaimResult {
-        gross: market.pool_a,
-        fee: 0,
-        net: market.pool_a,
-    };
-    let refund_b = ClaimResult {
-        gross: market.pool_b,
-        fee: 0,
-        net: market.pool_b,
-    };
-    Ok((refund_a, refund_b))
+    Ok(CancelPreview {
+        refund_a: market.pool_a,
+        refund_b: market.pool_b,
+    })
 }
 
 pub fn claim(
@@ -728,6 +733,40 @@ pub fn preview_claim(
         });
     }
 
+    if market.result != RESULT_CANCELLED && side != market.result {
+        return Ok(ClaimResult {
+            gross: 0,
+            fee: 0,
+            net: 0,
+        });
+    }
+    if market.result == RESULT_CANCELLED {
+        return Ok(ClaimResult {
+            gross: principal,
+            fee: 0,
+            net: principal,
+        });
+    }
+
+    // A settled position previews as nothing: `claim` is a no-op after the pull,
+    // so the preview must agree instead of promising a second payout.
+    if storage::has_claimed(env, market_id, side, participant) {
+        return Ok(ClaimResult {
+            gross: 0,
+            fee: 0,
+            net: 0,
+        });
+    }
+
+    let gross = winner_gross(&market, principal)?;
+    let fee = profit_fee(principal, gross, market.fee_bps)?;
+    Ok(ClaimResult {
+        gross,
+        fee,
+        net: gross - fee,
+    })
+}
+
 /// Explicit claim state for a wallet on one side, so callers never have to
 /// infer meaning from a zero amount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -769,38 +808,176 @@ pub fn preview_claim_state(
     Ok(ClaimState::Claimable)
 }
 
-    if market.result != RESULT_CANCELLED && side != market.result {
-        return Ok(ClaimResult {
-            gross: 0,
-            fee: 0,
-            net: 0,
-        });
-    }
-    if market.result == RESULT_CANCELLED {
-        return Ok(ClaimResult {
-            gross: principal,
-            fee: 0,
-            net: principal,
-        });
-    }
-
-    // A settled position previews as nothing: `claim` is a no-op after the pull,
-    // so the preview must agree instead of promising a second payout.
-    if storage::has_claimed(env, market_id, side, participant) {
-        return Ok(ClaimResult {
-            gross: 0,
-            fee: 0,
-            net: 0,
-        });
+/// Append a new depositor to the side's participant roster. The roster is what
+/// `get_entitlements_page` walks; it mirrors the deposit entries exactly.
+pub fn entitlements_page(
+    env: &Env,
+    market_id: u64,
+    offset: u32,
+    limit: u32,
+) -> Result<EntitlementPage, Error> {
+    // An unknown market is an explicit error, matching `get_market`, rather
+    // than an empty page that a caller could mistake for "no participants".
+    storage::get_market(env, market_id)?;
+    if limit > MAX_ENTITLEMENT_PAGE {
+        return Err(Error::PageTooLarge);
     }
 
-    let gross = winner_gross(&market, principal)?;
-    let fee = profit_fee(principal, gross, market.fee_bps)?;
-    Ok(ClaimResult {
-        gross,
-        fee,
-        net: gross - fee,
+    let side_a = storage::participants(env, market_id, SIDE_A);
+    let side_b = storage::participants(env, market_id, SIDE_B);
+    let total = side_a
+        .len()
+        .checked_add(side_b.len())
+        .ok_or(Error::Overflow)?;
+
+    let start = offset.min(total);
+    let remaining = total - start;
+    let take = if limit == 0 {
+        remaining
+    } else {
+        limit.min(remaining)
+    };
+
+    let mut items: soroban_sdk::Vec<ParticipantEntitlement> = soroban_sdk::Vec::new(env);
+    let mut cursor = start;
+    while cursor < start + take {
+        // Roster order is SIDE_A, then SIDE_B, each in deposit order. The same
+        // `offset` over unchanged state always restarts at the same record.
+        let (side, index) = if cursor < side_a.len() {
+            (SIDE_A, cursor)
+        } else {
+            (SIDE_B, cursor - side_a.len())
+        };
+        let participant = if side == SIDE_A {
+            side_a.get(index)
+        } else {
+            side_b.get(index)
+        }
+        .ok_or(Error::Overflow)?;
+        items.push_back(entitlement(env, market_id, side, &participant)?);
+        cursor += 1;
+    }
+
+    Ok(EntitlementPage {
+        items,
+        offset: start,
+        total,
     })
+}
+
+/// One participant's entitlement, read without performing any payment.
+///
+/// The amounts come from [`preview_claim`], so a record and the payout it
+/// previews cannot diverge. A settled position reports zeros with
+/// `claimed = true`; an unresolved market, a losing side or a missing position
+/// reports zeros with `claimed = false`.
+fn entitlement(
+    env: &Env,
+    market_id: u64,
+    side: u32,
+    participant: &Address,
+) -> Result<ParticipantEntitlement, Error> {
+    let principal = storage::deposit_of(env, market_id, side, participant);
+    let claimed = storage::has_claimed(env, market_id, side, participant);
+    let preview = preview_claim(env, market_id, side, participant)?;
+    Ok(ParticipantEntitlement {
+        participant: participant.clone(),
+        side,
+        principal,
+        gross: preview.gross,
+        fee: preview.fee,
+        net: preview.net,
+        claimed,
+    })
+}
+
+/// Pause or unpause new deposits and market creation. Withdrawals, claims and
+/// parked-payout retries never consult the flag, so pausing can never trap
+/// funds. The fee recipient administers the switch, mirroring the operational
+/// role that already receives accruals.
+pub fn set_paused(env: &Env, paused: bool) -> Result<(), Error> {
+    storage::fee_recipient(env)?.require_auth();
+    storage::set_paused(env, paused);
+    Ok(())
+}
+
+/// Versioned settlement manifest for a resolved market: the version tag plus
+/// the digest binding its winning side, fee policy and pool totals. Read-only.
+pub fn settlement_manifest(
+    env: &Env,
+    market_id: u64,
+) -> Result<(u32, soroban_sdk::BytesN<32>), Error> {
+    let market = storage::get_market(env, market_id)?;
+    if !market.resolved {
+        return Err(Error::NotClaimable);
+    }
+    let digest = settlement_manifest_digest(env, market_id, &market);
+    Ok((SETTLEMENT_MANIFEST_VERSION, digest))
+}
+
+/// Read-only settlement readiness for `market_id`, reporting whether the
+/// oracle may resolve and whether pre-deadline withdrawals are still open.
+pub fn settlement_readiness(env: &Env, market_id: u64) -> Result<SettlementReadiness, Error> {
+    let market = storage::get_market(env, market_id)?;
+    let now = env.ledger().timestamp();
+    Ok(SettlementReadiness {
+        resolved: market.resolved,
+        oracle_ready: !market.resolved && now >= market.deadline,
+        withdrawal_open: !market.resolved && now < market.deadline,
+        remaining_escrow: market.remaining_escrow,
+    })
+}
+
+/// Queue a fee-recipient rotation. The current fee recipient must authorize and
+/// the change is timelocked, so accruals cannot be redirected instantly.
+pub fn queue_fee_recipient(env: &Env, new_recipient: Address) -> Result<(), Error> {
+    storage::fee_recipient(env)?.require_auth();
+    let executable_at = env
+        .ledger()
+        .timestamp()
+        .checked_add(FEE_RECIPIENT_TIMELOCK_SECONDS)
+        .ok_or(Error::Overflow)?;
+
+    storage::set_pending_fee_recipient(
+        env,
+        &PendingFeeRecipient {
+            next: new_recipient.clone(),
+            executable_at,
+        },
+    );
+    events::FeeRecipientQueued {
+        next: new_recipient,
+        executable_at,
+    }
+    .publish(env);
+    Ok(())
+}
+
+pub fn cancel_fee_recipient(env: &Env) -> Result<(), Error> {
+    storage::fee_recipient(env)?.require_auth();
+    if storage::pending_fee_recipient(env).is_none() {
+        return Err(Error::NoFeeRecipientQueued);
+    }
+    storage::clear_pending_fee_recipient(env);
+    events::FeeRecipientCancelled { cancelled: true }.publish(env);
+    Ok(())
+}
+
+/// Permissionless once the timelock has elapsed.
+pub fn execute_fee_recipient(env: &Env) -> Result<(), Error> {
+    let queued = storage::pending_fee_recipient(env).ok_or(Error::NoFeeRecipientQueued)?;
+    if env.ledger().timestamp() < queued.executable_at {
+        return Err(Error::Timelocked);
+    }
+    let previous = storage::fee_recipient(env)?;
+    storage::set_fee_recipient(env, &queued.next);
+    storage::clear_pending_fee_recipient(env);
+    events::FeeRecipientChanged {
+        next: queued.next,
+        previous,
+    }
+    .publish(env);
+    Ok(())
 }
 
 /// Queue an oracle rotation. The current oracle must authorize — there is no
