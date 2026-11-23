@@ -33,7 +33,6 @@ if (typeof window !== "undefined") {
 
 
 
-
 export interface Claim {
   category: string;
   /**
@@ -718,11 +717,18 @@ export interface Client {
   get_pending_fee_policy: (options?: MethodOptions) => Promise<AssembledTransaction<Option<PendingFeePolicy>>>
 
   /**
+   * Construct and simulate a quote_payout_versioned transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Preview a payout only under the caller's explicitly required policy.
+   * Unsupported versions are refused before reading the claim or roster.
+   */
+  quote_payout_versioned: ({claim_id, challenger, required_version}: {claim_id: u64, challenger: string, required_version: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<VersionedPayoutQuote>>>
+
+  /**
    * Construct and simulate a claim_challenger_payout transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    * Settle one challenger's winning or refunded position. Callable once per
    * challenger after resolution, and O(1) in the number of challengers, so a
    * market filled to MAX_CHALLENGERS can always be paid out in full.
-   * 
+   *
    * `resolve_claim` deliberately does NOT loop over challengers: a Stellar
    * transaction is capped on its ledger-entry footprint, and paying ~100
    * challengers at once does not fit. Returns the net amount credited.
@@ -852,6 +858,7 @@ export class Client extends ContractClient {
         "AAAAAAAAAAAAAAATdHJhbnNpdGlvbl9kZWFkbGluZQAAAAABAAAAAAAAAAhjbGFpbV9pZAAAAAYAAAABAAAD6QAAAAIAAAAD",
         "AAAAAAAAAhhBIHBhZ2luYXRlZCB3aW5kb3cgaW50byB0aGUgY2hhbGxlbmdlciByb3N0ZXIuCgpSZXR1cm5zIHVwIHRvIGBsaW1pdGAgZW50cmllcyBzdGFydGluZyBhdCBgb2Zmc2V0YCAoMC1iYXNlZCkuCmBsaW1pdCA9IDBgIHJldHVybnMgYWxsIGVudHJpZXMgZnJvbSBgb2Zmc2V0YCB0byB0aGUgZW5kIG9mIHRoZSByb3N0ZXIg4oCUCmlkZW50aWNhbCB0byBgZ2V0X2NoYWxsZW5nZXJfbGlzdGAgd2hlbiBgb2Zmc2V0ID0gMGAuCgpUaGUgYENoYWxsZW5nZXJQYWdlYCByZXNwb25zZSBhbHdheXMgY2FycmllcyBgdG90YWxgIChmdWxsIHJvc3RlciBsZW5ndGgpCnNvIGNhbGxlcnMgY2FuIGRldGVjdCB0aGUgbGFzdCBwYWdlIHdpdGhvdXQgaXNzdWluZyBhbiBleHRyYSBlbXB0eSBmZXRjaC4KCk5laXRoZXIgYG9mZnNldGAgbm9yIGBsaW1pdGAgY2FuIGNhdXNlIGEgcGFuaWM6IGFuIGBvZmZzZXRgIGJleW9uZCB0aGUKZW5kIG9mIHRoZSByb3N0ZXIgcmV0dXJucyBhbiBlbXB0eSBgaXRlbXNgIHNsaWNlIHdpdGggYHRvdGFsYCBzZXQKY29ycmVjdGx5LgAAABRnZXRfY2hhbGxlbmdlcnNfcGFnZQAAAAMAAAAAAAAACGNsYWltX2lkAAAABgAAAAAAAAAGb2Zmc2V0AAAAAAAEAAAAAAAAAAVsaW1pdAAAAAAAAAQAAAABAAAH0AAAAA5DaGFsbGVuZ2VyUGFnZQAA",
         "AAAAAAAAAAAAAAAWZ2V0X3BlbmRpbmdfZmVlX3BvbGljeQAAAAAAAAAAAAEAAAPoAAAH0AAAABBQZW5kaW5nRmVlUG9saWN5",
+        "AAAAAAAAAIlQcmV2aWV3IGEgcGF5b3V0IG9ubHkgdW5kZXIgdGhlIGNhbGxlcidzIGV4cGxpY2l0bHkgcmVxdWlyZWQgcG9saWN5LgpVbnN1cHBvcnRlZCB2ZXJzaW9ucyBhcmUgcmVmdXNlZCBiZWZvcmUgcmVhZGluZyB0aGUgY2xhaW0gb3Igcm9zdGVyLgAAAAAAABZxdW90ZV9wYXlvdXRfdmVyc2lvbmVkAAAAAAADAAAAAAAAAAhjbGFpbV9pZAAAAAYAAAAAAAAACmNoYWxsZW5nZXIAAAAAABMAAAAAAAAAEHJlcXVpcmVkX3ZlcnNpb24AAAAEAAAAAQAAA+kAAAfQAAAAFFZlcnNpb25lZFBheW91dFF1b3RlAAAAAw==",
         "AAAAAAAAAaFTZXR0bGUgb25lIGNoYWxsZW5nZXIncyB3aW5uaW5nIG9yIHJlZnVuZGVkIHBvc2l0aW9uLiBDYWxsYWJsZSBvbmNlIHBlcgpjaGFsbGVuZ2VyIGFmdGVyIHJlc29sdXRpb24sIGFuZCBPKDEpIGluIHRoZSBudW1iZXIgb2YgY2hhbGxlbmdlcnMsIHNvIGEKbWFya2V0IGZpbGxlZCB0byBNQVhfQ0hBTExFTkdFUlMgY2FuIGFsd2F5cyBiZSBwYWlkIG91dCBpbiBmdWxsLgoKYHJlc29sdmVfY2xhaW1gIGRlbGliZXJhdGVseSBkb2VzIE5PVCBsb29wIG92ZXIgY2hhbGxlbmdlcnM6IGEgU3RlbGxhcgp0cmFuc2FjdGlvbiBpcyBjYXBwZWQgb24gaXRzIGxlZGdlci1lbnRyeSBmb290cHJpbnQsIGFuZCBwYXlpbmcgfjEwMApjaGFsbGVuZ2VycyBhdCBvbmNlIGRvZXMgbm90IGZpdC4gUmV0dXJucyB0aGUgbmV0IGFtb3VudCBjcmVkaXRlZC4AAAAAAAAXY2xhaW1fY2hhbGxlbmdlcl9wYXlvdXQAAAAAAgAAAAAAAAAKY2hhbGxlbmdlcgAAAAAAEwAAAAAAAAAIY2xhaW1faWQAAAAGAAAAAQAAA+kAAAALAAAAAw==",
         "AAAAAAAAAAAAAAAXZ2V0X2NsYWltX21hcmtldF9jb25maWcAAAAAAQAAAAAAAAAIY2xhaW1faWQAAAAGAAAAAQAAA+kAAAfQAAAADE1hcmtldENvbmZpZwAAAAM=",
         "AAAAAAAAAENXaGF0IGBjbGFpbV9jaGFsbGVuZ2VyX3BheW91dGAgd291bGQgcGF5IHRoaXMgY2hhbGxlbmdlciByaWdodCBub3cuAAAAABdxdW90ZV9jaGFsbGVuZ2VyX3BheW91dAAAAAACAAAAAAAAAAhjbGFpbV9pZAAAAAYAAAAAAAAACmNoYWxsZW5nZXIAAAAAABMAAAABAAAD6QAAB9AAAAALUGF5b3V0UXVvdGUAAAAAAw==",
@@ -895,6 +902,7 @@ export class Client extends ContractClient {
         transition_deadline: this.txFromJSON<Result<void>>,
         get_challengers_page: this.txFromJSON<ChallengerPage>,
         get_pending_fee_policy: this.txFromJSON<Option<PendingFeePolicy>>,
+        quote_payout_versioned: this.txFromJSON<Result<VersionedPayoutQuote>>,
         claim_challenger_payout: this.txFromJSON<Result<i128>>,
         get_claim_market_config: this.txFromJSON<Result<MarketConfig>>,
         quote_challenger_payout: this.txFromJSON<Result<PayoutQuote>>,

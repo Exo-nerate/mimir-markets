@@ -8,17 +8,21 @@
 ///
 /// Deliberate deviations from the Solidity original are marked
 /// `DEVIATION FROM SOLIDITY` at the point they occur.
-
 mod admin;
+mod claim_history;
 mod claims;
 pub mod contract;
 mod escrow;
-mod fees;
 pub mod events;
+mod fees;
 mod resolve;
 mod storage;
 mod types;
 mod util;
+/// Offline, chain-free check of a recorded settlement (#805).
+pub mod settlement_verifier;
+
+pub mod contract;
 
 pub use contract::{MimirMarket, MimirMarketClient};
 pub use types::*;

@@ -277,9 +277,17 @@ principal: i128;
   side: u32;
 }
 
-
-
-
+/**
+ * Bounded compatibility descriptor exposed for indexers. `schema_version`
+ * identifies the storage layout; `min_supported` and `max_supported` bound
+ * the schema interpretations this contract build can serve. Indexers must
+ * reject any required schema outside this range.
+ */
+export interface SchemaDescriptor {
+  max_supported: u32;
+  min_supported: u32;
+  schema_version: u32;
+}
 
 
 

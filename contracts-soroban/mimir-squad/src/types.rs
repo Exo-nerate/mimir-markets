@@ -53,6 +53,13 @@ pub const USDC_DECIMALS: u32 = 7;
 /// A queued oracle rotation cannot take effect before this much time passes.
 pub const ORACLE_TIMELOCK_SECONDS: u64 = 172_800; // 2 days
 
+/// Storage schema version of the squad pool contract, exposed to indexers so
+/// they can refuse to interpret storage written under an unsupported layout.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// Lowest schema version an indexer built against this descriptor will accept.
+pub const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
 /// A queued fee-recipient rotation cannot take effect before this much time passes.
 pub const FEE_RECIPIENT_TIMELOCK_SECONDS: u64 = 172_800; // 2 days
 
@@ -172,15 +179,11 @@ pub struct SquadLimits {
 /// single commitment, and so integer conservation (`pool_a + pool_b ==
 /// winners_payout_gross + fee_total + residual`) is verifiable exactly.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SettlementManifest {
-    pub version: u32,
-    pub result: u32,
-    pub fee_bps: u32,
-    pub pool_a: i128,
-    pub pool_b: i128,
-    pub liability_total: i128,
-    pub digest: soroban_sdk::BytesN<32>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchemaDescriptor {
+    pub schema_version: u32,
+    pub min_supported_version: u32,
+    pub usdc_decimals: u32,
 }
 
 /// Explicit claim state for a wallet's position in a squad market.
